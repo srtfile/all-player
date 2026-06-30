@@ -71,11 +71,15 @@
   </div>
 
   <div class="row">
-    <input type="text" id="refererInput" placeholder="Optional: Referer / Origin header (for CORS proxy mode)" />
+    <input type="text" id="refererInput" placeholder="Optional: Referer header" />
+    <input type="text" id="originInput" placeholder="Optional: Origin header" />
+  </div>
+
+  <div class="row">
     <div class="toggle-group">
       <button id="proxyToggle" title="Route request through CORS proxy">Use Proxy</button>
     </div>
-    <input type="text" id="proxyInput" value="https://corsproxy.io/?url=" placeholder="Proxy prefix URL" style="max-width:260px;"/>
+    <input type="text" id="proxyInput" value="https://foxy-doxy.andruilsyestems.workers.dev/proxy" placeholder="Proxy base URL" style="max-width:340px;"/>
   </div>
 
   <div class="player-wrap" id="playerWrap">
@@ -89,28 +93,33 @@
 
   <div class="hint">
     Supports: native HLS (Safari/iOS), hls.js fallback for everything else (Chrome/Firefox/Edge), dash.js for MPEG-DASH (.mpd),
-    direct MP4/WebM playback, and iframe embed fallback for embed pages (e.g. vidsrc-style players) that aren't raw media files.
-    For CORS-blocked streams, enable "Use Proxy" and supply a working proxy prefix (default corsproxy.io). Some sites require a
-    matching Referer header which browsers can't spoof client-side — for those, route through your own Cloudflare Worker/proxy.
+    direct MP4/WebM playback, and iframe embed fallback for embed pages that aren't raw media files.
+    For CORS-blocked or referer-locked streams, enable "Use Proxy" — the proxy worker expects
+    <code>?url=BASE64(url)&headers=BASE64(JSON headers)</code>, and Referer/Origin entered above are packed into that headers payload automatically.
+    All HLS sub-requests (manifests, key files, segments) are also routed through the proxy via hls.js's loader hooks, not just the initial URL, so
+    multi-level / encrypted / relative-path playlists keep working without re-typing the proxy per segment.
   </div>
 </div>
 
 <script>
-const urlInput   = document.getElementById('urlInput');
-const modeSelect = document.getElementById('modeSelect');
-const loadBtn    = document.getElementById('loadBtn');
-const video      = document.getElementById('video');
-const frame      = document.getElementById('frame');
-const statusEl   = document.getElementById('status');
-const metaEl     = document.getElementById('meta');
-const levelsEl   = document.getElementById('levels');
-const proxyToggle= document.getElementById('proxyToggle');
-const proxyInput = document.getElementById('proxyInput');
+const urlInput     = document.getElementById('urlInput');
+const modeSelect   = document.getElementById('modeSelect');
+const loadBtn      = document.getElementById('loadBtn');
+const video        = document.getElementById('video');
+const frame        = document.getElementById('frame');
+const statusEl     = document.getElementById('status');
+const metaEl       = document.getElementById('meta');
+const levelsEl     = document.getElementById('levels');
+const proxyToggle  = document.getElementById('proxyToggle');
+const proxyInput   = document.getElementById('proxyInput');
 const refererInput = document.getElementById('refererInput');
+const originInput  = document.getElementById('originInput');
 
 let hls = null;
 let dashPlayer = null;
 let proxyEnabled = false;
+let retryCount = 0;
+const MAX_RETRIES = 4;
 
 proxyToggle.addEventListener('click', () => {
   proxyEnabled = !proxyEnabled;
@@ -133,13 +142,35 @@ function resetPlayer(){
   frame.src = 'about:blank';
   levelsEl.innerHTML = '';
   metaEl.innerHTML = '';
+  retryCount = 0;
 }
 
-function buildUrl(raw){
+// --- base64 helpers that survive unicode ---
+function b64encode(str){
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+function buildHeaders(){
+  const headers = {};
+  const ref = refererInput.value.trim();
+  const org = originInput.value.trim();
+  if (ref) headers['Referer'] = ref;
+  if (org) headers['Origin'] = org;
+  return headers;
+}
+
+// builds a proxied URL in the foxy-doxy format: /proxy?url=B64&headers=B64
+function buildProxiedUrl(raw){
   if (!proxyEnabled) return raw;
-  const prefix = proxyInput.value.trim();
-  if (!prefix) return raw;
-  return prefix + encodeURIComponent(raw);
+  const base = proxyInput.value.trim();
+  if (!base) return raw;
+  const headers = buildHeaders();
+  const params = new URLSearchParams();
+  params.set('url', b64encode(raw));
+  if (Object.keys(headers).length){
+    params.set('headers', b64encode(JSON.stringify(headers)));
+  }
+  return `${base}?${params.toString()}`;
 }
 
 function detectType(url, forced){
@@ -148,11 +179,9 @@ function detectType(url, forced){
   if (clean.endsWith('.m3u8')) return 'hls';
   if (clean.endsWith('.mpd')) return 'dash';
   if (clean.endsWith('.mp4') || clean.endsWith('.webm') || clean.endsWith('.mkv') || clean.endsWith('.mov')) return 'mp4';
-  // heuristic: query string sometimes hides extension
   if (url.includes('.m3u8')) return 'hls';
   if (url.includes('.mpd')) return 'dash';
   if (url.includes('.mp4')) return 'mp4';
-  // fallback: treat as embed/iframe page
   return 'iframe';
 }
 
@@ -165,13 +194,33 @@ function showIframeEl(){
   video.style.display = 'none';
 }
 
-function loadHLS(url){
+// Custom hls.js loader: routes EVERY request (manifest, key, segment) through the
+// proxy with the same headers, so nested/relative playlist URLs keep working.
+function makeProxyLoaderClass(){
+  const DefaultLoader = Hls.DefaultConfig.loader;
+
+  class ProxyLoader extends DefaultLoader {
+    load(context, config, callbacks){
+      if (proxyEnabled && context.url && !context.url.startsWith(proxyInput.value.trim())){
+        context.url = buildProxiedUrl(context.url);
+      }
+      super.load(context, config, callbacks);
+    }
+  }
+  return ProxyLoader;
+}
+
+function loadHLS(originalUrl){
   showVideoEl();
   setStatus('Loading HLS stream...');
+  const startUrl = buildProxiedUrl(originalUrl);
 
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // Native HLS support (Safari/iOS)
-    video.src = url;
+  // Native HLS (Safari/iOS) can't use custom loaders/headers, so only use it
+  // when no proxy/headers are needed.
+  const needsCustomHandling = proxyEnabled || refererInput.value.trim() || originInput.value.trim();
+
+  if (!needsCustomHandling && video.canPlayType('application/vnd.apple.mpegurl') && !Hls.isSupported()) {
+    video.src = startUrl;
     video.addEventListener('loadedmetadata', () => {
       setStatus('Playing via native HLS.');
       video.play().catch(()=>{});
@@ -180,50 +229,86 @@ function loadHLS(url){
     return;
   }
 
-  if (Hls.isSupported()) {
-    hls = new Hls({
-      maxBufferLength: 30,
-      maxMaxBufferLength: 60,
-      enableWorker: true,
-      lowLatencyMode: false,
-      backBufferLength: 90,
-      xhrSetup: function(xhr) {
-        xhr.withCredentials = false;
-      }
-    });
-    hls.loadSource(url);
-    hls.attachMedia(video);
-
-    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-      setStatus(`Playing via hls.js — ${data.levels.length} quality level(s) found.`);
-      metaEl.innerHTML = `<span class="badge">HLS</span><span class="badge">${data.levels.length} levels</span>`;
-      buildLevelButtons(data.levels);
-      video.play().catch(()=>{});
-    });
-
-    hls.on(Hls.Events.ERROR, (event, data) => {
-      if (data.fatal) {
-        switch(data.type){
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            setStatus('Network error, retrying...', true);
-            hls.startLoad();
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            setStatus('Media error, attempting recovery...', true);
-            hls.recoverMediaError();
-            break;
-          default:
-            setStatus('Fatal HLS error: ' + data.details, true);
-            hls.destroy();
-            break;
-        }
-      } else {
-        console.warn('Non-fatal HLS issue:', data.details);
-      }
-    });
-  } else {
-    setStatus('HLS not supported in this browser.', true);
+  if (!Hls.isSupported()) {
+    setStatus('HLS not supported in this browser, falling back to native <video>.', true);
+    video.src = startUrl;
+    video.play().catch(()=>{});
+    return;
   }
+
+  const config = {
+    maxBufferLength: 30,
+    maxMaxBufferLength: 90,
+    maxBufferSize: 60 * 1000 * 1000,
+    enableWorker: true,
+    lowLatencyMode: false,
+    backBufferLength: 90,
+    manifestLoadingMaxRetry: 6,
+    manifestLoadingRetryDelay: 1000,
+    manifestLoadingMaxRetryTimeout: 8000,
+    levelLoadingMaxRetry: 6,
+    levelLoadingRetryDelay: 1000,
+    fragLoadingMaxRetry: 8,
+    fragLoadingRetryDelay: 1000,
+    fragLoadingMaxRetryTimeout: 10000,
+    xhrSetup: function(xhr) {
+      xhr.withCredentials = false;
+    }
+  };
+
+  // Attach custom loader only when we actually need to rewrite request URLs.
+  if (proxyEnabled) {
+    config.loader = makeProxyLoaderClass();
+  }
+
+  hls = new Hls(config);
+  hls.loadSource(startUrl);
+  hls.attachMedia(video);
+
+  hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+    retryCount = 0;
+    setStatus(`Playing via hls.js — ${data.levels.length} quality level(s) found.`);
+    metaEl.innerHTML = `<span class="badge">HLS</span><span class="badge">${data.levels.length} levels</span>`;
+    buildLevelButtons(data.levels);
+    video.play().catch(()=>{});
+  });
+
+  hls.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+    if (data.details && data.details.live) {
+      metaEl.innerHTML += `<span class="badge">LIVE</span>`;
+    }
+  });
+
+  hls.on(Hls.Events.ERROR, (event, data) => {
+    if (!data.fatal) {
+      console.warn('Non-fatal HLS issue:', data.details);
+      return;
+    }
+    switch(data.type){
+      case Hls.ErrorTypes.NETWORK_ERROR:
+        if (retryCount < MAX_RETRIES) {
+          retryCount++;
+          setStatus(`Network error (attempt ${retryCount}/${MAX_RETRIES}), retrying...`, true);
+          setTimeout(() => hls.startLoad(), 800 * retryCount);
+        } else {
+          setStatus('Network error: max retries reached. Try enabling the proxy or check the URL/headers.', true);
+        }
+        break;
+      case Hls.ErrorTypes.MEDIA_ERROR:
+        setStatus('Media error, attempting recovery...', true);
+        try {
+          hls.recoverMediaError();
+        } catch(e) {
+          setStatus('Media recovery failed: ' + e.message, true);
+        }
+        break;
+      default:
+        setStatus('Fatal HLS error: ' + data.details, true);
+        hls.destroy();
+        hls = null;
+        break;
+    }
+  });
 }
 
 function buildLevelButtons(levels){
@@ -243,14 +328,15 @@ function buildLevelButtons(levels){
   });
 }
 
-function loadDASH(url){
+function loadDASH(originalUrl){
   showVideoEl();
   setStatus('Loading DASH (.mpd) stream...');
+  const startUrl = buildProxiedUrl(originalUrl);
   dashPlayer = dashjs.MediaPlayer().create();
-  dashPlayer.initialize(video, url, true);
+  dashPlayer.initialize(video, startUrl, true);
   dashPlayer.updateSettings({
     streaming: {
-      retryAttempts: { MPD: 4, MediaSegment: 4 },
+      retryAttempts: { MPD: 6, MediaSegment: 6 },
       abr: { autoSwitchBitrate: { video: true } }
     }
   });
@@ -263,22 +349,24 @@ function loadDASH(url){
   });
 }
 
-function loadMP4(url){
+function loadMP4(originalUrl){
   showVideoEl();
   setStatus('Loading direct video file...');
-  video.src = url;
+  const startUrl = buildProxiedUrl(originalUrl);
+  video.src = startUrl;
   video.addEventListener('loadedmetadata', () => {
     setStatus(`Playing direct file. Duration: ${formatTime(video.duration)}`);
     metaEl.innerHTML = `<span class="badge">Direct file</span>`;
     video.play().catch(()=>{});
   }, { once:true });
-  video.addEventListener('error', () => setStatus('Failed to load direct video file (CORS or invalid URL).', true));
+  video.addEventListener('error', () => setStatus('Failed to load direct video file (try enabling proxy / setting Referer).', true));
 }
 
 function loadIframe(url){
   showIframeEl();
   setStatus('Loading as embed/iframe (no direct media URL detected).');
   metaEl.innerHTML = `<span class="badge">Embed / Iframe</span>`;
+  // Iframes can't be proxied through a JSON body; load raw URL.
   frame.src = url;
 }
 
@@ -293,14 +381,13 @@ function load(){
   if (!raw){ setStatus('Please enter a URL.', true); return; }
 
   resetPlayer();
-  const finalUrl = buildUrl(raw);
   const type = detectType(raw, modeSelect.value);
 
   switch(type){
-    case 'hls':   loadHLS(finalUrl); break;
-    case 'dash':  loadDASH(finalUrl); break;
-    case 'mp4':   loadMP4(finalUrl); break;
-    case 'iframe':loadIframe(raw); break; // iframes usually shouldn't go through a URL-encoding proxy
+    case 'hls':   loadHLS(raw); break;
+    case 'dash':  loadDASH(raw); break;
+    case 'mp4':   loadMP4(raw); break;
+    case 'iframe':loadIframe(raw); break;
     default:      setStatus('Unable to determine stream type.', true);
   }
 }
