@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Universal Stream Player</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dashjs/4.7.4/dash.all.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0d12; --panel:#141821; --accent:#5b8cff; --text:#e8ecf3; --muted:#8b93a7; --danger:#ff5b6e;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -10%, #1a2030, var(--bg)) ;
+    color:var(--text); min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px;
+  }
+  h1{font-size:18px; font-weight:600; margin:0 0 16px; color:var(--text); letter-spacing:.3px;}
+  .panel{
+    width:100%; max-width:920px; background:var(--panel); border:1px solid #232838;
+    border-radius:14px; padding:16px; box-shadow:0 10px 40px rgba(0,0,0,.4);
+  }
+  .row{display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;}
+  input[type=text]{
+    flex:1; min-width:220px; background:#0e121b; border:1px solid #262c3d; color:var(--text);
+    padding:11px 12px; border-radius:9px; font-size:14px; outline:none;
+  }
+  input[type=text]:focus{border-color:var(--accent);}
+  select, button{
+    background:#1b2233; border:1px solid #262c3d; color:var(--text); padding:11px 12px;
+    border-radius:9px; font-size:13px; cursor:pointer;
+  }
+  button.primary{background:var(--accent); border:none; font-weight:600;}
+  button.primary:hover{filter:brightness(1.1);}
+  button:hover{filter:brightness(1.15);}
+  .player-wrap{
+    position:relative; width:100%; aspect-ratio:16/9; background:#000; border-radius:10px;
+    overflow:hidden; margin-top:6px;
+  }
+  video, iframe{width:100%; height:100%; border:0; display:block;}
+  #status{
+    font-size:12.5px; color:var(--muted); margin-top:10px; min-height:18px; word-break:break-all;
+  }
+  #status.error{color:var(--danger);}
+  .meta{display:flex; gap:14px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-top:6px;}
+  .badge{background:#1b2233; padding:3px 9px; border-radius:20px; border:1px solid #262c3d;}
+  .levels{display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;}
+  .levels button{padding:6px 10px; font-size:12px;}
+  .levels button.active{background:var(--accent); border-color:var(--accent);}
+  .hint{font-size:11.5px; color:var(--muted); margin-top:14px; line-height:1.5;}
+  .toggle-group{display:flex; gap:6px;}
+  .toggle-group button.active{background:var(--accent); border-color:var(--accent);}
+</style>
+</head>
+<body>
+
+<h1>🎬 Universal Stream Player — HLS / DASH / MP4 / Embed</h1>
+
+<div class="panel">
+  <div class="row">
+    <input type="text" id="urlInput" placeholder="Paste m3u8 / mp4 / mpd / iframe-embed URL here..." />
+    <select id="modeSelect">
+      <option value="auto">Auto-detect</option>
+      <option value="hls">Force HLS (.m3u8)</option>
+      <option value="dash">Force DASH (.mpd)</option>
+      <option value="mp4">Force MP4 / direct</option>
+      <option value="iframe">Force Iframe / Embed</option>
+    </select>
+    <button class="primary" id="loadBtn">Load</button>
+  </div>
+
+  <div class="row">
+    <input type="text" id="refererInput" placeholder="Optional: Referer / Origin header (for CORS proxy mode)" />
+    <div class="toggle-group">
+      <button id="proxyToggle" title="Route request through CORS proxy">Use Proxy</button>
+    </div>
+    <input type="text" id="proxyInput" value="https://corsproxy.io/?url=" placeholder="Proxy prefix URL" style="max-width:260px;"/>
+  </div>
+
+  <div class="player-wrap" id="playerWrap">
+    <video id="video" controls playsinline style="display:none;"></video>
+    <iframe id="frame" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen sandbox="allow-scripts allow-same-origin allow-presentation allow-forms" style="display:none;"></iframe>
+  </div>
+
+  <div class="meta" id="meta"></div>
+  <div class="levels" id="levels"></div>
+  <div id="status">Paste a URL above and hit Load.</div>
+
+  <div class="hint">
+    Supports: native HLS (Safari/iOS), hls.js fallback for everything else (Chrome/Firefox/Edge), dash.js for MPEG-DASH (.mpd),
+    direct MP4/WebM playback, and iframe embed fallback for embed pages (e.g. vidsrc-style players) that aren't raw media files.
+    For CORS-blocked streams, enable "Use Proxy" and supply a working proxy prefix (default corsproxy.io). Some sites require a
+    matching Referer header which browsers can't spoof client-side — for those, route through your own Cloudflare Worker/proxy.
+  </div>
+</div>
+
+<script>
+const urlInput   = document.getElementById('urlInput');
+const modeSelect = document.getElementById('modeSelect');
+const loadBtn    = document.getElementById('loadBtn');
+const video      = document.getElementById('video');
+const frame      = document.getElementById('frame');
+const statusEl   = document.getElementById('status');
+const metaEl     = document.getElementById('meta');
+const levelsEl   = document.getElementById('levels');
+const proxyToggle= document.getElementById('proxyToggle');
+const proxyInput = document.getElementById('proxyInput');
+const refererInput = document.getElementById('refererInput');
+
+let hls = null;
+let dashPlayer = null;
+let proxyEnabled = false;
+
+proxyToggle.addEventListener('click', () => {
+  proxyEnabled = !proxyEnabled;
+  proxyToggle.classList.toggle('active', proxyEnabled);
+});
+
+function setStatus(msg, isError=false){
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('error', isError);
+}
+
+function resetPlayer(){
+  if (hls){ try{ hls.destroy(); }catch(e){} hls = null; }
+  if (dashPlayer){ try{ dashPlayer.reset(); }catch(e){} dashPlayer = null; }
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  video.style.display = 'none';
+  frame.style.display = 'none';
+  frame.src = 'about:blank';
+  levelsEl.innerHTML = '';
+  metaEl.innerHTML = '';
+}
+
+function buildUrl(raw){
+  if (!proxyEnabled) return raw;
+  const prefix = proxyInput.value.trim();
+  if (!prefix) return raw;
+  return prefix + encodeURIComponent(raw);
+}
+
+function detectType(url, forced){
+  if (forced && forced !== 'auto') return forced;
+  const clean = url.split('?')[0].toLowerCase();
+  if (clean.endsWith('.m3u8')) return 'hls';
+  if (clean.endsWith('.mpd')) return 'dash';
+  if (clean.endsWith('.mp4') || clean.endsWith('.webm') || clean.endsWith('.mkv') || clean.endsWith('.mov')) return 'mp4';
+  // heuristic: query string sometimes hides extension
+  if (url.includes('.m3u8')) return 'hls';
+  if (url.includes('.mpd')) return 'dash';
+  if (url.includes('.mp4')) return 'mp4';
+  // fallback: treat as embed/iframe page
+  return 'iframe';
+}
+
+function showVideoEl(){
+  video.style.display = 'block';
+  frame.style.display = 'none';
+}
+function showIframeEl(){
+  frame.style.display = 'block';
+  video.style.display = 'none';
+}
+
+function loadHLS(url){
+  showVideoEl();
+  setStatus('Loading HLS stream...');
+
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native HLS support (Safari/iOS)
+    video.src = url;
+    video.addEventListener('loadedmetadata', () => {
+      setStatus('Playing via native HLS.');
+      video.play().catch(()=>{});
+    }, { once:true });
+    video.addEventListener('error', () => setStatus('Native HLS failed to load this stream.', true));
+    return;
+  }
+
+  if (Hls.isSupported()) {
+    hls = new Hls({
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60,
+      enableWorker: true,
+      lowLatencyMode: false,
+      backBufferLength: 90,
+      xhrSetup: function(xhr) {
+        xhr.withCredentials = false;
+      }
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+      setStatus(`Playing via hls.js — ${data.levels.length} quality level(s) found.`);
+      metaEl.innerHTML = `<span class="badge">HLS</span><span class="badge">${data.levels.length} levels</span>`;
+      buildLevelButtons(data.levels);
+      video.play().catch(()=>{});
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        switch(data.type){
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            setStatus('Network error, retrying...', true);
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            setStatus('Media error, attempting recovery...', true);
+            hls.recoverMediaError();
+            break;
+          default:
+            setStatus('Fatal HLS error: ' + data.details, true);
+            hls.destroy();
+            break;
+        }
+      } else {
+        console.warn('Non-fatal HLS issue:', data.details);
+      }
+    });
+  } else {
+    setStatus('HLS not supported in this browser.', true);
+  }
+}
+
+function buildLevelButtons(levels){
+  levelsEl.innerHTML = '<button class="active" data-level="-1">Auto</button>';
+  levels.forEach((lvl, i) => {
+    const btn = document.createElement('button');
+    btn.textContent = lvl.height ? `${lvl.height}p` : `Level ${i}`;
+    btn.dataset.level = i;
+    levelsEl.appendChild(btn);
+  });
+  levelsEl.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      levelsEl.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      if (hls) hls.currentLevel = parseInt(btn.dataset.level, 10);
+    });
+  });
+}
+
+function loadDASH(url){
+  showVideoEl();
+  setStatus('Loading DASH (.mpd) stream...');
+  dashPlayer = dashjs.MediaPlayer().create();
+  dashPlayer.initialize(video, url, true);
+  dashPlayer.updateSettings({
+    streaming: {
+      retryAttempts: { MPD: 4, MediaSegment: 4 },
+      abr: { autoSwitchBitrate: { video: true } }
+    }
+  });
+  dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+    setStatus('Playing via dash.js.');
+    metaEl.innerHTML = `<span class="badge">DASH</span>`;
+  });
+  dashPlayer.on(dashjs.MediaPlayer.events.ERROR, (e) => {
+    setStatus('DASH error: ' + (e.error?.message || JSON.stringify(e.error)), true);
+  });
+}
+
+function loadMP4(url){
+  showVideoEl();
+  setStatus('Loading direct video file...');
+  video.src = url;
+  video.addEventListener('loadedmetadata', () => {
+    setStatus(`Playing direct file. Duration: ${formatTime(video.duration)}`);
+    metaEl.innerHTML = `<span class="badge">Direct file</span>`;
+    video.play().catch(()=>{});
+  }, { once:true });
+  video.addEventListener('error', () => setStatus('Failed to load direct video file (CORS or invalid URL).', true));
+}
+
+function loadIframe(url){
+  showIframeEl();
+  setStatus('Loading as embed/iframe (no direct media URL detected).');
+  metaEl.innerHTML = `<span class="badge">Embed / Iframe</span>`;
+  frame.src = url;
+}
+
+function formatTime(sec){
+  if (!isFinite(sec)) return 'live';
+  const m = Math.floor(sec/60), s = Math.floor(sec%60);
+  return `${m}:${s.toString().padStart(2,'0')}`;
+}
+
+function load(){
+  const raw = urlInput.value.trim();
+  if (!raw){ setStatus('Please enter a URL.', true); return; }
+
+  resetPlayer();
+  const finalUrl = buildUrl(raw);
+  const type = detectType(raw, modeSelect.value);
+
+  switch(type){
+    case 'hls':   loadHLS(finalUrl); break;
+    case 'dash':  loadDASH(finalUrl); break;
+    case 'mp4':   loadMP4(finalUrl); break;
+    case 'iframe':loadIframe(raw); break; // iframes usually shouldn't go through a URL-encoding proxy
+    default:      setStatus('Unable to determine stream type.', true);
+  }
+}
+
+loadBtn.addEventListener('click', load);
+urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+</script>
+</body>
+</html>
